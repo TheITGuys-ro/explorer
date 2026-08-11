@@ -5,6 +5,8 @@ using System.Drawing;
 using System.Windows.Forms;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileExplorerPro;
 
@@ -15,6 +17,11 @@ public partial class Form1 : Form
 
     private SplitContainer mainSplitter;
     
+    // Progress UI
+    private Panel progressPanel;
+    private ProgressBar actionProgressBar;
+    private Label actionProgressLabel;
+    
     // Left Pane Controls
     private TextBox leftPathBox;
     private ListView leftListView;
@@ -24,6 +31,7 @@ public partial class Form1 : Form
     private ListView rightListView;
 
     private bool isLeftActive = true;
+    private bool isProcessing = false;
 
     // Premium Color Palette (Dark Theme)
     private Color bgColor = Color.FromArgb(32, 32, 32);
@@ -106,8 +114,17 @@ public partial class Form1 : Form
         rightListView.DoubleClick += (s, e) => HandleDoubleClick(rightListView, rightPathBox);
         mainSplitter.Panel2.Controls.Add(CreatePaneContainer(rightPathBox, rightListView));
 
+        // Progress Panel
+        progressPanel = new Panel { Dock = DockStyle.Bottom, Height = 30, Padding = new Padding(15, 0, 15, 10), BackColor = bgColor, Visible = false };
+        actionProgressLabel = new Label { Dock = DockStyle.Right, Width = 350, ForeColor = textColor, TextAlign = ContentAlignment.MiddleRight, Font = mainFont, AutoEllipsis = true };
+        actionProgressBar = new ProgressBar { Dock = DockStyle.Fill, Style = ProgressBarStyle.Continuous };
+        progressPanel.Controls.Add(actionProgressBar);
+        progressPanel.Controls.Add(actionProgressLabel);
+
         this.Controls.Add(mainSplitter);
+        this.Controls.Add(progressPanel);
         this.Controls.Add(bottomPanel);
+        mainSplitter.BringToFront(); // Ensures Fill takes remaining space and doesn't overlap Bottom docks
         this.KeyPreview = true;
         this.KeyDown += Form1_KeyDown;
         
@@ -254,6 +271,8 @@ public partial class Form1 : Form
 
     private void Form1_KeyDown(object? sender, KeyEventArgs e)
     {
+        if (isProcessing) return;
+        
         if (e.KeyCode == Keys.F5) { PerformAction(FileAction.Copy); e.Handled = true; }
         else if (e.KeyCode == Keys.F6) { PerformAction(FileAction.Move); e.Handled = true; }
         else if (e.KeyCode == Keys.F8 || e.KeyCode == Keys.Delete) { PerformAction(FileAction.Delete); e.Handled = true; }
@@ -339,6 +358,7 @@ public partial class Form1 : Form
 
     private void HandleDoubleClick(ListView lv, TextBox pathBox)
     {
+        if (isProcessing) return;
         if (lv.SelectedItems.Count == 0) return;
         string path = (string)lv.SelectedItems[0].Tag;
 
@@ -390,8 +410,18 @@ public partial class Form1 : Form
 
     private enum FileAction { Copy, Move, Delete }
 
-    private void PerformAction(FileAction action)
+    private class FileProgress
     {
+        public long TotalBytes { get; set; }
+        public long BytesTransferred { get; set; }
+        public string CurrentFile { get; set; }
+        public bool IsIndeterminate { get; set; }
+    }
+
+    private async void PerformAction(FileAction action)
+    {
+        if (isProcessing) return;
+        
         ListView sourceLv = isLeftActive ? leftListView : rightListView;
         TextBox destPathBox = isLeftActive ? rightPathBox : leftPathBox;
         
@@ -418,8 +448,52 @@ public partial class Form1 : Form
         }
 
         string msg = $"Are you sure you want to {action} {selectedPaths.Count} item(s)?";
-        if (MessageBox.Show(msg, "Confirm", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+        if (MessageBox.Show(msg, "Confirm", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        isProcessing = true;
+
+        // Disable UI
+        progressPanel.Visible = true;
+        actionProgressBar.Value = 0;
+        actionProgressBar.Style = ProgressBarStyle.Marquee;
+        actionProgressLabel.Text = "Calculating size...";
+
+        var progress = new Progress<FileProgress>(p =>
         {
+            if (p.IsIndeterminate)
+            {
+                actionProgressBar.Style = ProgressBarStyle.Marquee;
+                actionProgressLabel.Text = $"Processing: {Path.GetFileName(p.CurrentFile)}";
+            }
+            else
+            {
+                actionProgressBar.Style = ProgressBarStyle.Continuous;
+                if (p.TotalBytes > 0)
+                {
+                    int pct = (int)(p.BytesTransferred * 100 / p.TotalBytes);
+                    actionProgressBar.Value = Math.Max(0, Math.Min(100, pct));
+                }
+                actionProgressLabel.Text = $"Remaining: {p.CurrentFile} | {FormatSize(p.BytesTransferred)} / {FormatSize(p.TotalBytes)}";
+            }
+        });
+
+        Stopwatch sw = Stopwatch.StartNew();
+
+        await Task.Run(() =>
+        {
+            // 1. Calculate Total Size (if not delete)
+            long totalBytes = 0;
+            if (action != FileAction.Delete)
+            {
+                foreach (string src in selectedPaths)
+                {
+                    totalBytes += GetTotalSize(src);
+                }
+            }
+
+            long bytesTransferred = 0;
+
             foreach (string sourcePath in selectedPaths)
             {
                 try
@@ -432,51 +506,119 @@ public partial class Form1 : Form
 
                     if (action == FileAction.Copy)
                     {
-                        if (isDir) DirectoryCopy(sourcePath, destPath, true);
-                        else File.Copy(sourcePath, destPath, true);
+                        if (isDir) CopyDirectoryWithProgress(sourcePath, destPath, totalBytes, ref bytesTransferred, progress, sw);
+                        else CopyFileWithProgress(sourcePath, destPath, totalBytes, ref bytesTransferred, progress, sw);
                     }
                     else if (action == FileAction.Move)
                     {
-                        if (isDir) Directory.Move(sourcePath, destPath);
-                        else File.Move(sourcePath, destPath, true);
+                        // Check if same drive
+                        bool sameDrive = Path.GetPathRoot(Path.GetFullPath(sourcePath)).Equals(Path.GetPathRoot(Path.GetFullPath(destPath)), StringComparison.OrdinalIgnoreCase);
+                        if (sameDrive)
+                        {
+                            ((IProgress<FileProgress>)progress).Report(new FileProgress { IsIndeterminate = true, CurrentFile = itemName });
+                            if (isDir) Directory.Move(sourcePath, destPath);
+                            else File.Move(sourcePath, destPath);
+                        }
+                        else
+                        {
+                            if (isDir) CopyDirectoryWithProgress(sourcePath, destPath, totalBytes, ref bytesTransferred, progress, sw);
+                            else CopyFileWithProgress(sourcePath, destPath, totalBytes, ref bytesTransferred, progress, sw);
+                            if (isDir) Directory.Delete(sourcePath, true);
+                            else File.Delete(sourcePath);
+                        }
                     }
                     else if (action == FileAction.Delete)
                     {
+                        ((IProgress<FileProgress>)progress).Report(new FileProgress { IsIndeterminate = true, CurrentFile = itemName });
                         if (isDir) Directory.Delete(sourcePath, true);
                         else File.Delete(sourcePath);
                     }
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Error processing {sourcePath}:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    this.Invoke(new Action(() => MessageBox.Show($"Error processing {sourcePath}:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)));
                 }
             }
-            RefreshPane(true);
-            RefreshPane(false);
+        });
+
+        progressPanel.Visible = false;
+        isProcessing = false;
+        RefreshPane(true);
+        RefreshPane(false);
+    }
+
+    private long GetTotalSize(string path)
+    {
+        if (File.Exists(path))
+            return new FileInfo(path).Length;
+        else if (Directory.Exists(path))
+        {
+            long size = 0;
+            try
+            {
+                DirectoryInfo dir = new DirectoryInfo(path);
+                foreach (FileInfo fi in dir.GetFiles("*", SearchOption.AllDirectories))
+                    size += fi.Length;
+            }
+            catch { }
+            return size;
+        }
+        return 0;
+    }
+
+    private void CopyFileWithProgress(string source, string dest, long totalBytes, ref long bytesTransferred, IProgress<FileProgress> progress, Stopwatch sw)
+    {
+        byte[] buffer = new byte[1024 * 1024]; // 1MB chunk
+        long lastReportTime = 0;
+        using (FileStream fsIn = new FileStream(source, FileMode.Open, FileAccess.Read))
+        using (FileStream fsOut = new FileStream(dest, FileMode.Create, FileAccess.Write))
+        {
+            int bytesRead;
+            while ((bytesRead = fsIn.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                fsOut.Write(buffer, 0, bytesRead);
+                bytesTransferred += bytesRead;
+
+                long elapsedMs = sw.ElapsedMilliseconds;
+                if (elapsedMs - lastReportTime > 100 || bytesTransferred == totalBytes)
+                {
+                    lastReportTime = elapsedMs;
+                    string timeStr = "Calculating...";
+                    if (elapsedMs > 500 && bytesTransferred > 0)
+                    {
+                        long bytesPerSec = (long)(bytesTransferred / (elapsedMs / 1000.0));
+                        if (bytesPerSec > 0)
+                        {
+                            long remainingBytes = Math.Max(0, totalBytes - bytesTransferred);
+                            long secondsLeft = remainingBytes / bytesPerSec;
+                            TimeSpan ts = TimeSpan.FromSeconds(secondsLeft);
+                            timeStr = ts.ToString(@"hh\:mm\:ss");
+                        }
+                    }
+
+                    progress.Report(new FileProgress 
+                    { 
+                        TotalBytes = totalBytes, 
+                        BytesTransferred = bytesTransferred, 
+                        CurrentFile = timeStr 
+                    });
+                }
+            }
         }
     }
 
-    private static void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs)
+    private void CopyDirectoryWithProgress(string sourceDir, string destDir, long totalBytes, ref long bytesTransferred, IProgress<FileProgress> progress, Stopwatch sw)
     {
-        DirectoryInfo dir = new DirectoryInfo(sourceDirName);
-        if (!dir.Exists) throw new DirectoryNotFoundException("Source directory does not exist or could not be found: " + sourceDirName);
-
-        DirectoryInfo[] dirs = dir.GetDirectories();
-        Directory.CreateDirectory(destDirName);
-
-        foreach (FileInfo file in dir.GetFiles())
+        Directory.CreateDirectory(destDir);
+        foreach (string file in Directory.GetFiles(sourceDir))
         {
-            string tempPath = Path.Combine(destDirName, file.Name);
-            file.CopyTo(tempPath, true);
+            string destFile = Path.Combine(destDir, Path.GetFileName(file));
+            CopyFileWithProgress(file, destFile, totalBytes, ref bytesTransferred, progress, sw);
         }
-
-        if (copySubDirs)
+        foreach (string dir in Directory.GetDirectories(sourceDir))
         {
-            foreach (DirectoryInfo subdir in dirs)
-            {
-                string tempPath = Path.Combine(destDirName, subdir.Name);
-                DirectoryCopy(subdir.FullName, tempPath, copySubDirs);
-            }
+            string destSubDir = Path.Combine(destDir, Path.GetFileName(dir));
+            CopyDirectoryWithProgress(dir, destSubDir, totalBytes, ref bytesTransferred, progress, sw);
         }
     }
 }
